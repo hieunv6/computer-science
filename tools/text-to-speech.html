@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Text to Speech Teleprompter</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#667085; --accent:#2563eb; --hl:#fde047; --done:#98a2b3; --border:#d9dde3; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151a; --card:#1b2028; --fg:#e8eaed; --muted:#98a2b3; --accent:#60a5fa; --hl:#a16207; --done:#5b6573; --border:#2e3540; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:860px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:8px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px; }
+  textarea { width:100%; min-height:140px; padding:10px; font:inherit; color:inherit; background:var(--bg); border:1px solid var(--border); border-radius:8px; resize:vertical; }
+  .row { display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; align-items:end; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:.85rem; color:var(--muted); flex:1 1 200px; }
+  select, input[type=range] { width:100%; font:inherit; color:var(--fg); }
+  select { padding:6px; background:var(--bg); border:1px solid var(--border); border-radius:6px; }
+  button { font:inherit; padding:8px 16px; border-radius:8px; border:1px solid var(--border); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #prompter { font-size:1.9rem; line-height:1.7; height:50vh; overflow-y:auto; padding:16px; scroll-behavior:smooth; }
+  #prompter span.w { padding:0 2px; border-radius:4px; cursor:pointer; transition:color .15s; }
+  #prompter span.read { color:var(--done); }
+  #prompter span.cur { background:var(--hl); color:inherit; }
+  .small { font-size:.85rem; color:var(--muted); }
+  #warn { color:#b42318; display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Text to Speech Teleprompter</h1>
+  <p id="warn">Your browser does not support speech synthesis. Try Chrome, Edge, Safari or Firefox.</p>
+
+  <section class="card">
+    <textarea id="text" aria-label="Text to read">Paste or type your text here. Each word is highlighted live as it is spoken, like a teleprompter. Click any word to start reading from that point.</textarea>
+    <div class="row">
+      <label>Voice (English)
+        <select id="voice"></select>
+      </label>
+      <label>Speed: <b id="rateVal">1.0×</b>
+        <input id="rate" type="range" min="0.5" max="2.5" step="0.1" value="1">
+      </label>
+      <label>Pitch: <b id="pitchVal">1.0</b>
+        <input id="pitch" type="range" min="0.5" max="2" step="0.1" value="1">
+      </label>
+      <label>Volume: <b id="volVal">100%</b>
+        <input id="vol" type="range" min="0" max="1" step="0.05" value="1">
+      </label>
+    </div>
+    <div class="row">
+      <button id="play" class="primary">▶ Play</button>
+      <button id="pause">⏸ Pause</button>
+      <button id="stop">⏹ Stop</button>
+      <span class="small">Speed changes apply from the current word.</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div id="prompter" aria-live="off"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  if (!('speechSynthesis' in window)) { document.getElementById('warn').style.display = 'block'; return; }
+  const synth = window.speechSynthesis;
+  const $ = id => document.getElementById(id);
+  const textEl = $('text'), voiceEl = $('voice'), prompter = $('prompter');
+
+  let words = [];      // {text, start, end, el}
+  let current = -1;    // index of highlighted word
+  let startIdx = 0;    // word index at which current utterance began
+  let offsetBase = 0;  // char offset of utterance text within full text
+  let playing = false, paused = false, gotBoundary = false, fallbackTimer = null;
+  let session = 0;     // invalidates stale utterance callbacks
+
+  function buildPrompter() {
+    const text = textEl.value;
+    prompter.textContent = '';
+    words = [];
+    const re = /\S+/g; let m, last = 0;
+    while ((m = re.exec(text))) {
+      prompter.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const el = document.createElement('span');
+      el.className = 'w'; el.textContent = m[0];
+      const i = words.length;
+      el.addEventListener('click', () => speak(i));
+      prompter.appendChild(el);
+      words.push({ text: m[0], start: m.index, end: m.index + m[0].length, el });
+      last = m.index + m[0].length;
+    }
+    prompter.appendChild(document.createTextNode(text.slice(last)));
+    current = -1;
+  }
+
+  function highlight(i) {
+    if (i === current) return;
+    current = i;
+    words.forEach((w, k) => {
+      w.el.classList.toggle('read', k < i);
+      w.el.classList.toggle('cur', k === i);
+    });
+    const el = words[i] && words[i].el;
+    if (el) prompter.scrollTop = el.offsetTop - prompter.clientHeight / 2 + el.offsetHeight / 2;
+  }
+
+  function clearHighlight() {
+    current = -1;
+    words.forEach(w => w.el.classList.remove('read', 'cur'));
+  }
+
+  function loadVoices() {
+    const all = synth.getVoices().filter(v => /^en/i.test(v.lang));
+    const prev = voiceEl.value;
+    voiceEl.textContent = '';
+    all.forEach(v => {
+      const o = document.createElement('option');
+      o.value = v.name; o.textContent = v.name + ' (' + v.lang + ')';
+      voiceEl.appendChild(o);
+    });
+    if (prev) voiceEl.value = prev;
+  }
+  loadVoices();
+  synth.addEventListener('voiceschanged', loadVoices);
+
+  function stopFallback() { clearInterval(fallbackTimer); fallbackTimer = null; }
+
+  // Estimated per-word timing, used only if the browser sends no boundary events.
+  function startFallback(from, mySession) {
+    stopFallback();
+    const rate = parseFloat($('rate').value);
+    let i = from;
+    const next = () => {
+      if (mySession !== session || i >= words.length) return stopFallback();
+      highlight(i);
+      const w = words[i++].text;
+      clearInterval(fallbackTimer);
+      const ms = (60 + w.length * 65 + (/[.,;:!?]$/.test(w) ? 250 : 0)) / rate;
+      fallbackTimer = setTimeout(next, ms);
+    };
+    next();
+  }
+
+  function speak(from) {
+    if (!words.length) return;
+    synth.cancel(); stopFallback();
+    const my = ++session;
+    startIdx = from;
+    offsetBase = words[from].start;
+    gotBoundary = false;
+    const u = new SpeechSynthesisUtterance(textEl.value.slice(offsetBase));
+    const v = synth.getVoices().find(x => x.name === voiceEl.value);
+    if (v) { u.voice = v; u.lang = v.lang; } else u.lang = 'en-US';
+    u.rate = parseFloat($('rate').value);
+    u.pitch = parseFloat($('pitch').value);
+    u.volume = parseFloat($('vol').value);
+    u.onboundary = e => {
+      if (my !== session || (e.name && e.name !== 'word')) return;
+      gotBoundary = true; stopFallback();
+      const pos = offsetBase + e.charIndex;
+      let lo = startIdx;
+      for (let k = startIdx; k < words.length; k++) { if (words[k].start <= pos) lo = k; else break; }
+      highlight(lo);
+    };
+    u.onstart = () => {
+      if (my !== session) return;
+      highlight(from);
+      // If no boundary event arrives shortly, fall back to timed highlighting.
+      setTimeout(() => { if (my === session && !gotBoundary && playing && !paused) startFallback(from, my); }, 600);
+    };
+    u.onend = () => {
+      if (my !== session) return;
+      stopFallback(); playing = false; paused = false;
+      words.forEach(w => { w.el.classList.add('read'); w.el.classList.remove('cur'); });
+      current = -1; updateButtons();
+    };
+    u.onerror = e => { if (my === session && e.error !== 'interrupted' && e.error !== 'canceled') { playing = false; updateButtons(); } };
+    playing = true; paused = false; updateButtons();
+    synth.speak(u);
+  }
+
+  function updateButtons() {
+    $('pause').textContent = paused ? '▶ Resume' : '⏸ Pause';
+    $('pause').disabled = !playing;
+    $('stop').disabled = !playing;
+    $('play').textContent = playing ? '↻ Restart' : '▶ Play';
+  }
+
+  $('play').onclick = () => { buildPrompter(); speak(0); };
+  $('pause').onclick = () => {
+    if (!playing) return;
+    if (paused) { synth.resume(); paused = false; } else { synth.pause(); paused = true; stopFallback(); }
+    updateButtons();
+  };
+  $('stop').onclick = () => {
+    session++; synth.cancel(); stopFallback();
+    playing = paused = false; clearHighlight(); updateButtons();
+  };
+
+  // Live speed/pitch/volume: restart from the current word.
+  function bindSlider(id, label, fmt) {
+    const el = $(id);
+    el.addEventListener('input', () => {
+      $(label).textContent = fmt(el.value);
+      if (playing && !paused) speak(Math.max(current, 0));
+    });
+  }
+  bindSlider('rate', 'rateVal', v => parseFloat(v).toFixed(1) + '×');
+  bindSlider('pitch', 'pitchVal', v => parseFloat(v).toFixed(1));
+  bindSlider('vol', 'volVal', v => Math.round(v * 100) + '%');
+  voiceEl.addEventListener('change', () => { if (playing && !paused) speak(Math.max(current, 0)); });
+
+  textEl.addEventListener('input', () => {
+    if (playing) { session++; synth.cancel(); stopFallback(); playing = paused = false; updateButtons(); }
+    buildPrompter();
+  });
+  window.addEventListener('beforeunload', () => synth.cancel());
+
+  buildPrompter(); updateButtons();
+})();
+</script>
+</body>
+</html>
